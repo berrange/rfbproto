@@ -135,6 +135,68 @@ model, the General Input Interface (gii) protocol extension provides
 possibilities for input sources with more axes, relative movement and
 more buttons.
 
+External Protocol Tunnelling
+============================
+
+The core RFB protocol provides a way to receive updates about the
+content of a remote framebuffer, and a way to interact with it using
+input events. Extensions to the RFB protocol have provided
+additional features beyond simple framebuffer and input events.
+There are a number of reasons to wish to integrate extra features
+directly with the RFB protocol:
+
+ - **Single sign on** - one authentication mechanism provides
+   access to all the features associated with the server.
+ - **Encryption** - all the features are protected by a
+   consistent encryption layer.
+ - **Network ports** - only a single network port needs to
+   be exposed from the server.
+ - **Transport encapsulation** - the RFB protocol can be
+   encapsulated in a HTTP WebSockets connection to facilitate
+   access to browser based clients.
+
+The need to define RFB protocol messages for extensions, however,
+is a significant burden for enabling certain types of functionality,
+both in terms of specification and implementation. There are a
+number of very feature rich protocols targetting specific use
+cases, which have actively developed existing implementations
+for both client and server:
+
+ - *File transfer* - `WebDAV <https://www.ietf.org/rfc/rfc4918.txt>`_,
+   `MTP <https://en.wikipedia.org/wiki/Media_Transfer_Protocol>`_
+ - *CDROM remote* - `NBD <https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.md>`_,
+   `iSCSI <https://en.wikipedia.org/wiki/ISCSI>`_
+ - *USB remoting* - `USB-IP <https://github.com/torvalds/linux/blob/master/Documentation/usb/usbip_protocol.rst>`_,
+   `USB Redir <https://gitlab.freedesktop.org/spice/usbredir/-/blob/master/docs/usb-redirection-protocol.md>`_
+
+Attempting match these with RFB protocol messages is not a sensible
+use of time. The interleaving of different types of data on the same
+connection also makes it challenging for implementations to achieve
+the low latency required for certain types of data. For example a
+non-incremental framebuffer update covering the entire remote screen
+can involve the transmission of many MB of data. This is enough to
+introduce stalls in any audio transfer that is happening concurrently.
+
+To address the downsides, while still keeping the upsides, a general
+purpose tunnelling facility is introduced, with support indicated
+via the `QEMU Tunnel Pseudo-encoding`_. This extends the RFB protocol
+session from a single connection model, to a multiple connection model.
+One connection provides the traditional RFB services for the remote
+framebuffer and input devices, while zero or more additional connections
+encapsulate other protocols to provide rich featureset for concepts
+such as file transfer, remote storage, USB device remoting, and more.
+
+All connections will start off with the normal RFB protocol negotiation
+for security types and encodings. After the `SetEncodings` client message,
+however, it is possible to switch the connection to instead start running
+the externally defined protocol. This protocol will be tunnelled over the
+RFB transport layer and so benefit from the encryption facilities
+negotiated during the security handshake. This removes the requirement
+for the external protocol to provide authentication or encryption services,
+and also lets it be seemlessly used over existing network transports such
+as HTTP WebSockets.
+
+
 Representation of Pixel Data
 ============================
 
@@ -1874,6 +1936,7 @@ Submessage Type  Pseudo Encoding  Description
 ================ ================ ====================
 0                -258             Extended key events
 1                -259             Audio
+2                -262             Tunnel
 ================ ================ ====================
 
 QEMU Extended Key Event Message
@@ -2004,6 +2067,69 @@ Value  No. of bytes  Type
 ====== ============= =======
 
 The *nchannels* field must be either ``1`` (mono) or ``2`` (stereo).
+
+QEMU Tunnel Client Message
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This submessage allows the client to negotiate configuration and
+usage of external protocol tunnels. It is only permissible to send
+this type of message after the server has acknowledged support for
+the `QEMU external protocol tunnels-encoding` pseudo-encoding
+by sending a `QEMU Server Message` response with `QEMU Tunnel Server Message`_
+subtype and `QEMU Tunnel Server Message Init`_ operation.
+
+QEMU Tunnel Client Message Upgrade
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This operation may be sent by the client after receiving the
+`QEMU Tunnel Server Message Init`_ operation, to upgrade the
+tunnel extension to a version newer than the default, ``0``.
+
+================= ===================== ========== =======================
+No. of bytes      Type                  [Value]    Description
+================= ===================== ========== =======================
+1                 ``U8``                255        *message-type*
+1                 ``U8``                2          *submessage-type*
+2                 ``U16``               0          *operation*
+4                 ``U32``                          *version*
+================= ===================== ========== =======================
+
+The *version* must be between 0 and the *max-version* reported in
+the previous `QEMU Tunnel Server Message Init`_ operation. If the
+*version* is outside the permitted boundary, the server must
+immediately terminate the connection.
+
+After sending this message, both the client and server are now
+permitted to use any additional client and server tunnel operations
+that were not defined in the original specification.
+
+QEMU Tunnel Client Message Start
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This operation is to be sent by the client to request the start of a
+specific tunnel. If the request is confirmed by the server, then the
+external protocol associated with the tunnel will take over the
+current connection. The implication of this is that a client will
+need to open a new connection to the server for each tunnel that is
+to be used. Usual practice will be for the first connection to be
+used for the regular RFB protocol to interact with the remote
+framebuffer, and subsequent connections to be used for tunnels.
+If a client is not interested in the framebuffer content, however,
+it is permitted to use the first connection to start a tunnel.
+
+================= ===================== ========== =======================
+No. of bytes      Type                  [Value]    Description
+================= ===================== ========== =======================
+1                 ``U8``                255        *message-type*
+1                 ``U8``                2          *submessage-type*
+2                 ``U16``               1          *operation*
+4                 ``U32``                          *id-length*
+*id-length*       ``U8`` array                     *id-string*
+================= ===================== ========== =======================
+
+The *id-length* and *id-string* fields refer to the unique ID for a
+tunnel whose existance is advertized by the server. The server will
+respond with a `QEMU Tunnel Server Message Start` message.
 
 Server to Client Messages
 +++++++++++++++++++++++++
@@ -2294,6 +2420,7 @@ determined by the *submessage-type*. Possible values for
 Submessage Type  Pseudo Encoding  Description
 ================ ================ ====================
 1                -259             Audio
+2                -262             Tunnel
 ================ ================ ====================
 
 Submessage type 0 is unused, since the
@@ -2345,6 +2472,173 @@ No. of bytes    Type                 [Value]    Description
 The *data-length* will be a multiple of (*sample-format* * *nchannels*)
 as requested by the client in an earlier `QEMU Audio Client Message`_.
 
+QEMU Tunnel Server Message
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This submessage allows the server to negotiate configuration and
+usage of external protocol tunnels. It is only permissible to send
+this message if the client has advertized support for the
+`QEMU external protocol tunnels-encoding` pseudo-encoding. There
+are a number of operations that the server can support.
+
+QEMU Tunnel Server Message Init
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+This operation is to be sent by the server after a `SetEncodings`_
+message is received that includes the
+`QEMU external protocol tunnels-encoding` pseudo-encoding.
+
+============= ===================== ========== =======================
+No. of bytes  Type                  [Value]    Description
+============= ===================== ========== =======================
+1             ``U8``                255        *message-type*
+1             ``U8``                2          *submessage-type*
+2             ``U16``               0          *operation*
+4             ``U32``               0          *max-version*
+============= ===================== ========== =======================
+
+The *max-version* field indicates the maximum version of this extension
+that the server is able to support. The initial version is assumed to be
+``0`` and the client may request use of a version upto *max-version* by
+sending the `QEMU Tunnel Client Message Upgrade`_ operation message. At
+the time of writing only version ``0`` is defined.
+
+The protocol now proceeds with the server sending a `QEMU Server Message`_
+with the `QEMU Tunnel Server Message`_ subtype and a
+`QEMU Tunnel Server Message Info`_ operation, to provide details on
+the tunnels available from this server.
+
+QEMU Tunnel Server Message Info
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+This operation is to be sent by the server immediately after
+the `QEMU Tunnel Server Message Init`_ operation, to
+indicate what tunnels are available. It may sent again by
+the server any time the set of available tunnels, or their
+status, changes.
+
+================ ===================== ========== =======================
+No. of bytes     Type                  [Value]    Description
+================ ===================== ========== =======================
+1                ``U8``                255        *message-type*
+1                ``U8``                2          *submessage-type*
+2                ``U16``               1          *operation*
+4                ``U32``                          *num-of-tunnels*
+*num-of-tunnels* ``TUNNEL-INFO`` array            *tunnels*
+================ ===================== ========== =======================
+
+The *num-of-tunnels* field  informs the client about the available
+tunnels that the server has available for use. Each ``TUNNEL-INFO``
+element is defined as follows:
+
+==================== ==================== =======================
+No. of bytes         Type                 Description
+==================== ==================== =======================
+4                    ``U32``              *status*
+4                    ``U32``              *protocol-length*
+*protocol-length*    ``U8`` array         *protocol-string*
+4                    ``U32``              *id-length*
+*id-length*          ``U8`` array         *id-string*
+4                    ``U32``              *description-length*
+*description-length* ``U8`` array         *description-string*
+==================== ==================== =======================
+
+The *protocol-length* and *protocol-string* field define a unique
+identifier for the protocol to be run over the tunnel. Currently
+defined protocols names are
+
+=========== ==============================================================
+Name        Specification / description
+=========== ==============================================================
+`console`   raw byte stream for an interactive text console
+`nbd`       `NBD <https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.md>`_
+`usb-redir` `USB Redir <https://gitlab.freedesktop.org/spice/usbredir/-/blob/master/docs/usb-redirection-protocol.md>`_
+=========== ==============================================================
+
+To cope with future additions to this specification, clients should
+be prepared to receive protocol names that are not currently documents.
+
+Implementors can use custom protocol names that are not listed in
+this spec, but must always use reverse domain name notation as a
+prefix for the name. e.g. ``org.somedomain.someprotocol``). Names
+without a domain prefix are reserved for this specification.
+
+For each *protocol* it is permitted to have multiple tunnel instances
+defined, so the *id-length* and *id-string* fields are used to uniquely
+identify each tunnel. The ID strings are always to be encoded in UTF-8,
+however, beyond that there are no restrictions on their format. The
+server can choose any name that it desires and the client should treat
+this has a opaque string.
+
+The *status* value indicates the availability of the tunnel and is
+one of the following values
+
+============ ==================================
+Number       Description
+============ ==================================
+0            Available
+1            Unavailable, currently in use
+2            Unavailable, temporary restriction
+============ ==================================
+
+If the client receives any *status* values not listed in this doc,
+they must be asssumed to mean ``Unavailable``.
+
+The ID strings are intended for machine usage and thus should not be
+assumed to be suitable for displaying to a user. The *description-length*
+and *description-string* fields define a human targetted string that
+identifies the purpose of the tunnel.
+
+After receiving this message, the protocol proceeeds with any other
+valid RFB server or client message type.
+
+QEMU Tunnel Server Message Start
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+This operation is to be sent by the server after receiving a
+`QEMU Tunnel Client Message Start`_ operation message.
+
+================= ===================== ========== =======================
+No. of bytes      Type                  [Value]    Description
+================= ===================== ========== =======================
+1                 ``U8``                255        *message-type*
+1                 ``U8``                2          *submessage-type*
+2                 ``U16``               2          *operation*
+1                 ``U8``                           *status*
+================= ===================== ========== =======================
+
+The *status* value indicates whether the attempt to start the tunnel
+was successful. The following status values are currently defined:
+
+============ =====================================
+Number       Description
+============ =====================================
+0            Success
+1            Error, tunnel no longer exists
+2            Error, tunnel already in use
+2            Error, tunnel temporarily unavailable
+============ =====================================
+
+Clients must treat any other values received as indicating
+an error condition.
+
+When an error is reported, both the client and server must
+now terminate the connection, without sending any further
+RFB messages of any type.
+
+When the server confirms that tunnel is successfully started, no
+further RFB protocol messages are permitted on the connection.
+Henceforth the connection should be assumed to be transporting
+the external protocol associated with the tunnel.
+
+Note that if the VNC security type negotiation resulted in the
+establishment of a data encryption facility for the connection,
+this must continue to be applied to data sent and received for
+the tunnelled protocol. This applies to both TLS encryption
+and SASL data encryption. With this in mind, the tunnelled
+protocol may choose to skip its own authentication and encryption
+negotiation.
+
 Encodings
 +++++++++
 
@@ -2381,6 +2675,7 @@ Number       Name
 -258         `QEMU Extended Key Event Pseudo-encoding`_
 -259         `QEMU Audio Pseudo-encoding`_
 -261         `QEMU LED State Pseudo-encoding`_
+-262         `QEMU Tunnel Pseudo-encoding`_
 -305         `gii Pseudo-encoding`_
 -307         `DesktopName Pseudo-encoding`_
 -308         `ExtendedDesktopSize Pseudo-encoding`_
@@ -3500,6 +3795,18 @@ The remaining bits are reserved and must be ignored.
 An update must be sent whenever the server state changes, but may also
 be sent at other times to compensate for variance in behaviour between
 the server and client keyboard handling.
+
+QEMU Tunnel Pseudo-encoding
+---------------------------
+
+A client that supports this encoding is indicating that it supports
+tunnelling of external protocols over the VNC connection. This brings
+a consistent approach to authentication, encryption and network access
+control and encapsulation between the main VNC protocol and the tunnelled
+protocol. If the server accepts the encoding, it will send a
+`QEMU server message`_ with the `QEMU Tunnel Server Message`_ subtype
+and `QEMU Tunnel Server Message Init`_ operation.
+
 
 gii Pseudo-encoding
 -------------------
